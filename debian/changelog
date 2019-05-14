@@ -1,3 +1,9 @@
+dkms (2.3-3ubuntu9.3) bionic; urgency=medium
+
+  * 0017-fix-OBSOLETE_BY-in-DKMS.CONF-Closes-81.patch: OBSOLETE_BY in DKMS.CONF (LP: #1828948)
+
+ -- Alex Tu <alex.tu@canonical.com>  Tue, 14 May 2019 16:48:00 +0800
+
 dkms (2.3-3ubuntu9.2) bionic; urgency=medium
 
   * 0009-Add-support-for-UEFI-Secure-Boot-validation-toggling.patch: source
