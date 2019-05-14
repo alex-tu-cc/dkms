@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 #  Dynamic Kernel Module Support (DKMS) <dkms-devel@dell.com>
-#  Copyright (C) 2003-2008 Dell, Inc.
+#  Copyright (C) 2004-2008 Dell, Inc.
 #  by Gary Lerhaupt, Matt Domsch, & Mario Limonciello
 #  Copyright (C) 2012 by Darik Horn <dajhorn@vanadac.com>
 #
@@ -20,6 +20,7 @@
 #    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 #
 
+shopt -s extglob
 
 # All of the variables we will accept from dkms.conf.
 # Does not include directives
@@ -48,6 +49,9 @@ _get_kernel_dir() {
        Linux)          DIR="/lib/modules/$KVER/build" ;;
        GNU/kFreeBSD)   DIR="/usr/src/kfreebsd-headers-$KVER/sys" ;;
     esac
+
+    [ ! -z "$ksourcedir_fromcli" ] && DIR=$kernel_source_dir
+
     echo $DIR
 }
 
@@ -72,10 +76,18 @@ invoke_command()
     if [[ $3 = background && ! $verbose ]]; then
         local pid progresspid
         (eval "$1" >/dev/null 2>&1) & pid=$!
-        while [ -d /proc/$pid ]; do
-            sleep 3
-            echo -en "."
-        done & progresspid=$!
+        {
+            on_exit() {
+                kill $(jobs -p) 2>/dev/null
+                wait $(jobs -p) 2>/dev/null
+            }
+            trap on_exit EXIT
+            while [ -d /proc/$pid ]; do
+                sleep 3 &
+                wait $!
+                echo -en "."
+            done
+        } & progresspid=$!
         wait $pid 2>/dev/null
         exitval=$?
         kill $progresspid 2>/dev/null
@@ -96,7 +108,7 @@ error() (
 
 warn() (
     exec >&2
-    echo -n "$Warning: "
+    echo -n $"Warning: "
     for s in "$@"; do echo "$s"; done
 )
 
@@ -121,7 +133,7 @@ show_usage()
 {
     echo $"Usage: $0 [action] [options]"
     echo $"  [action]  = { add | remove | build | install | uninstall | match | autoinstall"
-    echo $"               | mkdriverdisk | mktarball | ldtarball | mkrpm | mkkmp | mkdeb | status }"
+    echo $"               | mkdriverdisk | mktarball | ldtarball | mkrpm | mkkmp | mkdeb | mkbmdeb | status }"
     echo $"  [options] = [-m module] [-v module-version] [-k kernel-version] [-a arch]"
     echo $"              [-d distro] [-c dkms.conf-location] [-q] [--force] [--all]"
     echo $"              [--templatekernel=kernel] [--directive='cli-directive=cli-value']"
@@ -707,7 +719,7 @@ read_conf()
 
 # Little helper function for parsing the output of modinfo.
 get_module_verinfo(){
-    unset res
+    res=
     local vals=
     while read -a vals; do
     case ${vals[0]} in
@@ -828,16 +840,17 @@ moduleconfig_update_obsoletes()
     # Do all the changes at once, record the diffs for posterity
     for file in "$@"; do
         [[ $file && -w $file ]] || continue
+	_tmpf="$temp_dir_name/${file##*/}.new"
         if [[ $file = /etc/sysconfig/kernel ]]; then
-            sed "${sa_sck_o[*]}" "$file" > "$temp_dir_name/${file##*/}.new"
+	    [ -z "${sa_sck_o[@]}" ] || sed "${sa_sck_o[@]}" "$file" > "$_tmpf"
         else
-            sed "${sa_mc_o[*]}" "$file" > "$temp_dir_name/${file##*/}.new"
+	    [ -z "${sa_mc_o[@]}" ] || sed "${sa_mc_o[@]}" "$file" > "$_tmpf"
         fi
-        if ! mod_diff=$(diff -u "$temp_dir_name/${file##*/}.new" "$file"); then
+	if [ -f "$_tmpf" ] && ! mod_diff=$(diff -u "$_tmpf" "$file"); then
             echo $"$file updated to replace obsoleted module references:"
             echo "$mod_diff"
-            cp -fp "$temp_dir_name/${file##*/}.new" "$file"
-            rm -f "$temp_dir_name/${file##*/}.new"
+	    cp -fp "$_tmpf" "$file"
+	    rm -f "$_tmpf"
         fi
     done
 }
@@ -1339,10 +1352,29 @@ clean_build()
     rm -rf "$dkms_tree/$module/$module_version/build"
 }
 
+sign_build()
+{
+    local base_dir="$dkms_tree/$module/$module_version/$kernelver/$arch"
+    if type update-secureboot-policy >/dev/null 2>&1; then
+        echo $"Signing module:"
+        SHIM_NOTRIGGER=y update-secureboot-policy --new-key
+        for ko in `find "$base_dir/module/" -name "*.ko" -print`;
+        do
+            echo " - $ko"
+            kmodsign sha512 \
+                /var/lib/shim-signed/mok/MOK.priv \
+                /var/lib/shim-signed/mok/MOK.der \
+                "$ko"
+        done
+        update-secureboot-policy --enroll-key
+    fi
+}
+
 build_module()
 {
     prepare_build
     do_build
+    sign_build
     clean_build
     echo $""
     echo $"DKMS: build completed."
@@ -1888,8 +1920,8 @@ module_status_weak() {
     # $4 = kernel arch, $5 = kernel version built for
 	[ -z "$NO_WEAK_MODULES" ] || return 1
     [[ $weak_modules ]] || return 1
-    local m v k a weak_ko mod installed_ko f ret=1 oifs=$IFS
-    local -a already_found
+    local m v k a kern weak_ko mod installed_ko f ret=1 oifs=$IFS
+    local -A already_found
     for weak_ko in "$install_tree/"*/weak-updates/*; do
         [[ -e $weak_ko ]] || continue
         [[ -L $weak_ko ]] && installed_ko="$(readlink -f "$weak_ko")" || continue
@@ -1897,12 +1929,17 @@ module_status_weak() {
         kern=${weak_ko#$install_tree/}
         kern=${kern%/weak-updates/*}
         [[ $m = ${1:-*} && $v = ${2:-*} && $k = ${5:-*} && $a = ${4:-*} && $kern = ${3:-*} ]] || continue
+	already_found[$m/$v/$kern/$a/$k]+=${weak_ko##*/}" "
+    done
+    # Check to see that all ko's are present for each module
+    for mod in ${!already_found[@]}; do
+	IFS=/ read m v k a kern <<< "$mod"
+	# ensure each module is weak linked
+	for installed_ko in $(find $dkms_tree/$m/$v/$kern/$a/module -type f); do
+	    [[ ${already_found[$mod]} != *"$installed_ko"* ]] && continue 2
+	done
         ret=0
-        for f in "${already_found[@]}"; do
-            [[ $f = $m/$v/$kern/$a/$k ]] && continue 2
-        done
-        already_found[${#already_found[@]}]="$m/$v/$kern/$a/$k"
-        echo "installed-weak $m/$v/$kern/$a/$k"
+        echo "installed-weak $mod"
     done
     return $ret
 }
@@ -1941,7 +1978,7 @@ module_status_built_extra() (
 # we do not get word splitting where it would be inconvienent.
 module_status_built() {
     local ret=1 directory ka k a state oifs="$IFS" IFS=''
-    for directory in "$dkms_tree/$1/$2/"${3:-[0-9].*}/${4:-*}; do
+    for directory in "$dkms_tree/$1/$2/"${3:-+([0-9]).*}/${4:-*}; do
         IFS="$oifs"
         ka="${directory#$dkms_tree/$1/$2/}"
         k="${ka%/*}"
@@ -2968,6 +3005,8 @@ preproc_file()
     local date_str="$(date -R)"
     echo "modifying $1..."
     sed -e "s/DEBIAN_PACKAGE/$debian_package/g" \
+	-e "s/DEBIAN_BUILD_ARCH/$debian_build_arch/g" \
+	-e "s/KERNEL_VERSION/$kernelver/g" \
         -e "s/MODULE_NAME/$module/g" \
         -e "s/MODULE_VERSION/$module_version/g" \
         -e "s/DATE_STAMP/$date_str/" "$1" > "$1.dkms-pp"
@@ -3030,6 +3069,7 @@ make_debian()
     make_common_test "mk${create_type}"
 
     debian_package=${module//_/-}
+    debian_build_arch=$(dpkg-architecture -qDEB_BUILD_ARCH)
 
     # Read the conf file
     read_conf_or_die "$kernelver" "$arch"
@@ -3102,7 +3142,16 @@ make_debian()
             die 7 $"There was a problem creating your ${create_type}."
         echo $""
         echo $"DKMS: mk${create_type} completed."
-        invoke_command "mv '$temp_dir/${debian_package}-dkms_${module_version}_all.deb' '$deb_basedir'" "Moving built files to $deb_basedir"
+	invoke_command "mv '$temp_dir/${debian_package}-dkms_${module_version}_${debian_build_arch}.deb' '$deb_basedir'" "Moving built files to $deb_basedir"
+	;;
+    bmdeb)
+	export KVER="$kernelver"
+	export KARCH="$arch"
+	invoke_command "dpkg-buildpackage -rfakeroot -d -b -us -uc 1>/dev/null" "Building binary package" || \
+	    die 7 $"There was a problem creating your ${create_type}."
+	echo $""
+	echo $"DKMS: mk${create_type} completed."
+	invoke_command "mv '$temp_dir/${debian_package}-modules-${kernelver}_${module_version}_${debian_build_arch}.deb' '$deb_basedir'" "Moving built files to $deb_basedir"
         ;;
     esac
     popd > /dev/null 2>&1
@@ -3629,7 +3678,7 @@ die_is_fatal="yes"
 [ -x /usr/lib/module-init-tools/weak-modules ] && weak_modules='/usr/lib/module-init-tools/weak-modules'
 no_depmod=""
 
-action_re='^(remove|(auto|un)?install|match|mk(driverdisk|tarball|rpm|deb|dsc|kmp)|build|add|status|ldtarball)$'
+action_re='^(remove|(auto|un)?install|match|mk(driverdisk|tarball|rpm|deb|bmdeb|dsc|kmp)|build|add|status|ldtarball)$'
 
 # Parse command line arguments
 while (($# > 0)); do
@@ -3854,6 +3903,9 @@ for action_to_run in $action; do
         ;;
     mkdeb)
         make_debian "deb"
+        ;;
+    mkbmdeb)
+        make_debian "bmdeb"
         ;;
     mkdsc)
         make_debian "dsc"
