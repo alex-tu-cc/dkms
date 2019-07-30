@@ -1,3 +1,9 @@
+dkms (2.3-3ubuntu9.4lp1838245) bionic; urgency=medium
+
+  * test buil
+
+ -- Alex Tu <alex.tu@canonical.com>  Tue, 30 Jul 2019 14:43:16 +0800
+
 dkms (2.3-3ubuntu9.4) bionic; urgency=medium
 
   * 0017-fix-OBSOLETE_BY-in-DKMS.CONF-Closes-81.patch: OBSOLETE_BY in DKMS.CONF
