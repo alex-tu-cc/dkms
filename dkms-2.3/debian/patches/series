@@ -16,3 +16,4 @@
 0016-make-sure-info-are-reset.patch
 0017-fix-OBSOLETE_BY-in-DKMS.CONF-Closes-81.patch
 lp-1827697.patch
+0019-fix-dkms-script-is-missing-function-find_module-LP-1.patch
